@@ -1,0 +1,520 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Image Isometric</title>
+<style>
+  :root { --bg: #0d0b0c; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg);
+    overflow: hidden;
+    overscroll-behavior: none;
+    cursor: default;
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: none;
+  }
+  body.card-hover { cursor: pointer; }
+  canvas { position: fixed; inset: 0; display: block; }
+
+  .mode-toggle {
+    position: fixed;
+    left: 50%;
+    bottom: 32px;
+    transform: translateX(-50%);
+    z-index: 10;
+    padding: 10px 18px;
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    border-radius: 999px;
+    background: rgba(20, 18, 19, 0.72);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    color: #f4f2f1;
+    font: 500 13px/1 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    letter-spacing: 0.02em;
+    cursor: pointer;
+    transition: background 0.2s, border-color 0.2s;
+  }
+  .mode-toggle:hover { background: rgba(40, 36, 38, 0.85); border-color: rgba(255, 255, 255, 0.3); }
+  .mode-toggle:focus-visible { outline: 2px solid #f4f2f1; outline-offset: 3px; }
+</style>
+<script type="importmap">
+  { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js" } }
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js"></script>
+<link rel="stylesheet" href="vendor/dialkit/styles.css" />
+<script src="vendor/dialkit/browser.global.js"></script>
+</head>
+<body>
+<button class="mode-toggle" id="modeToggle" type="button" aria-pressed="false">Isometric view</button>
+
+<script type="x-shader/x-vertex" id="vert">
+  uniform float uSkew;      // radians, signed
+  uniform float uScaleX;    // 1 → 0.91 at full speed
+  uniform float uVelocity;  // -1..1 normalised speed
+  uniform float uTime;
+  uniform float uBend;      // px the top/bottom edges trail at full speed
+  uniform vec2 uTravel;     // unit vector of the layout's forward axis on screen
+  uniform float uRipple;    // px of ripple at full speed
+  uniform float uDir;       // +1 / -1: this row's travel direction
+  uniform float uIsoSkew;   // radians: resting shear in isometric mode (Figma ≈ 24°)
+  uniform float uFlip;      // per card: click-flip angle (radians, around the vertical axis)
+  varying vec2 vUv;
+
+  void main() {
+    vUv = uv;
+    vec3 pos = position;
+    float vel = uVelocity * uDir;
+
+    // Narrow + shear (the Figma "Scrolling" frame). y is up in three.js,
+    // so a positive skew lowers the right edge, matching the design.
+    pos.x *= uScaleX;
+    pos.y -= pos.x * tan(uSkew * uDir);
+
+    // Isometric mode ("Images - Scrolling Isometric" frame): cards rest
+    // sheared with the right edge lower, the same direction as the scroll skew.
+    // That shear is folded into the click flip below (uFlip = 0 → plain shear).
+    //
+    // Click flip around the card's vertical axis. The card's horizontal edge
+    // turns from its own slant direction a = (1, -tan) toward the scene's
+    // depth axis b, which isometric projection draws as the mirrored slant
+    // (1, +tan). Flat view has no visible depth axis (k = 0), so there it's a
+    // plain squeeze; in isometric view the card swings round through the
+    // opposite slant like a real 3D turn.
+    float isoTan = tan(uIsoSkew);
+    float k = clamp(isoTan / 0.4452, 0.0, 1.0);   // 0.4452 = tan(24°)
+    float c = cos(uFlip), sn = sin(uFlip);
+    float ex = pos.x;
+    pos.x = ex * (c + k * sn);
+    pos.y += ex * isoTan * (sn - c);
+
+    // Drag bend, like a sail: the card is held by its top and bottom edges and
+    // air resistance pushes its middle backwards, so the middle trails behind
+    // the direction of travel. Cards move along -uTravel * vel, so "behind"
+    // is +uTravel * vel.
+    float speed = abs(vel);
+    float lag = sin(uv.y * 3.14159);         // 1 at the middle, 0 at top/bottom
+    pos.xy += uTravel * vel * uBend * lag;
+
+    // Soft ripple that travels across the card
+    pos.y += sin(uv.x * 6.2831 + uTime * 6.0) * speed * uRipple;
+
+
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
+  }
+</script>
+
+<script type="x-shader/x-fragment" id="frag">
+  uniform sampler2D uTexture;
+  uniform vec2 uImageRes;   // texture px
+  uniform vec2 uPlaneRes;   // card px (250×320)
+  uniform float uRadius;    // corner radius px
+  uniform float uVelocity;  // -1..1
+  uniform float uRgbShift;  // UV offset at full speed
+  uniform float uVignette;  // 0..1 edge darkening at full speed
+  uniform float uDir;       // +1 / -1: this row's travel direction
+  uniform float uOpacity;   // per card: fades extra rows out in isometric mode
+  varying vec2 vUv;
+
+  // object-fit: cover
+  vec2 coverUv(vec2 uv) {
+    float planeAspect = uPlaneRes.x / uPlaneRes.y;
+    float imageAspect = uImageRes.x / uImageRes.y;
+    vec2 scale = planeAspect > imageAspect
+      ? vec2(1.0, imageAspect / planeAspect)
+      : vec2(planeAspect / imageAspect, 1.0);
+    return (uv - 0.5) * scale + 0.5;
+  }
+
+  float roundedBox(vec2 p, vec2 halfSize, float r) {
+    vec2 q = abs(p) - halfSize + r;
+    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+  }
+
+  void main() {
+    vec2 uv = coverUv(gl_FrontFacing ? vUv : vec2(1.0 - vUv.x, vUv.y));
+
+    // RGB split along the scroll direction, scaled by speed
+    float shift = uVelocity * uDir * uRgbShift;
+    float r = texture2D(uTexture, uv + vec2(shift, 0.0)).r;
+    float g = texture2D(uTexture, uv).g;
+    float b = texture2D(uTexture, uv - vec2(shift, 0.0)).b;
+    vec3 color = vec3(r, g, b);
+
+    // Slight zoom-in feel: darken edges a touch while moving
+    float vignette = smoothstep(0.9, 0.2, length(vUv - 0.5)) ;
+    color *= mix(1.0, (1.0 - uVignette) + uVignette * vignette, abs(uVelocity));
+
+    // Rounded corners with anti-aliased edge
+    vec2 p = (vUv - 0.5) * uPlaneRes;
+    float d = roundedBox(p, uPlaneRes * 0.5, uRadius);
+    float alpha = 1.0 - smoothstep(-fwidth(d), fwidth(d), d);
+
+    gl_FragColor = vec4(color, alpha * uOpacity);
+    #include <colorspace_fragment>
+  }
+</script>
+
+<script type="module">
+  import * as THREE from "three";
+
+  // Photos exported from the Atlas library into ./photos
+  const PHOTOS = Array.from({ length: 14 }, (_, i) => `photos/${String(i + 1).padStart(2, "0")}.jpg`);
+
+  // From Figma: rest = 250×320 cards, 12px gap, first card at x = -24.
+  // Scrolling = cards shear vertically (~24°: 98px drop over 228px) and narrow to 228px (0.91).
+  const CARD_W = 250, CARD_H = 320;
+  const START_X = -24;
+  const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // ---------- DialKit: live tuning panel (defaults = Figma values) ----------
+  const dialRoot = DialKit.createDialRoot({ position: "top-right", theme: "dark" });
+  const dial = DialKit.createDialKit("Gallery", {
+    motion: {
+      maxSkew: [24, 0, 60, 0.5],          // deg at full speed (measured from Figma)
+      shrink: [0, 0, 1, 0.01],            // 0 = none, 0.09 = Figma (228/250), 1 = collapses at full speed
+      velForMax: [2200, 300, 8000, 50],   // px/s that reaches full effect
+      scrollDuration: [1.2, 0.1, 3, 0.05],
+      skewDuration: [0.6, 0.05, 2, 0.05],
+      wheelSpeed: [1, 0.2, 4, 0.1],
+    },
+    shader: {
+      bend: [18, 0, 120, 1],
+      ripple: [4, 0, 40, 0.5],
+      rgbShift: [0.018, 0, 0.1, 0.001],
+      vignette: [0.25, 0, 1, 0.01],
+    },
+    // Defaults measured from Figma frame "Images - Scrolling Isometric" (8:19)
+    isometric: {
+      stepX: [182, 40, 400, 1],           // px right per card along the staircase
+      stepY: [108, -300, 300, 1],         // px up per card (≈30° rise)
+      cardSkew: [24, 0, 60, 0.5],         // deg resting shear, right edge lower
+      cardScaleX: [0.91, 0.5, 1, 0.01],   // 228 / 250
+      offsetX: [-26, -600, 600, 1],       // staircase centre vs. screen centre
+      offsetY: [11, -600, 600, 1],
+      extraRows: false,                   // keep rows 2+ visible in this mode
+      scale: [1, 0.4, 2, 0.01],
+      transition: [1.1, 0.2, 3, 0.05],    // s for the flat ↔ iso switch
+    },
+    hover: {
+      lift: [16, 0, 80, 1],               // px the hovered card rises
+      duration: [0.45, 0.05, 2, 0.05],    // s, ease-out
+      flipDuration: [0.6, 0.2, 3, 0.05],  // s for the click spin
+      jumpHeight: [160, 0, 400, 1],        // px the card jumps above its hover lift
+      flipAngle: [180, 90, 1080, 90],     // deg per click
+      flipDirection: { type: "select", options: ["right", "left"], default: "right" },
+      flipEase: {
+        type: "select",
+        default: "power2.out",
+        options: [
+          "none", "power1.out", "power2.out", "power3.out", "power4.out",
+          "power2.inOut", "power3.inOut", "expo.out", "circ.out", "sine.inOut",
+          "back.out(1.7)", "back.inOut(1.7)", "elastic.out(1, 0.5)", "bounce.out",
+        ],
+      },
+    },
+    layout: {
+      rows: [1, 1, 4, 1],
+      rowGap: [12, 0, 200, 1],
+      stagger: [0.5, 0, 1, 0.05],         // row offset, as a fraction of a card
+      alternate: false,                   // odd rows travel the other way
+      gap: [12, 0, 80, 1],
+      radius: [4, 0, 60, 1],
+      background: "#0d0b0c",
+    },
+  }, { id: "gallery", persist: true });
+  let P = dial.getValues();
+  const STEP = () => CARD_W + P.layout.gap;
+  const LOOP = () => PHOTOS.length * STEP();
+
+  // ---------- three.js setup: orthographic camera in CSS pixels ----------
+  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+  renderer.setClearColor(0x0d0b0c, 1);
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  document.body.appendChild(renderer.domElement);
+
+  const scene = new THREE.Scene();
+  // Generous near/far range so nothing is ever clipped
+  const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, -20000, 20000);
+
+  // All cards live in one group (scaled in isometric mode)
+  const world = new THREE.Group();
+  scene.add(world);
+
+  function resize() {
+    const w = innerWidth, h = innerHeight;
+    renderer.setSize(w, h);
+    camera.left = -w / 2; camera.right = w / 2;
+    camera.top = h / 2; camera.bottom = -h / 2;
+    camera.updateProjectionMatrix();
+  }
+  addEventListener("resize", resize);
+  resize();
+
+  // ---------- cards ----------
+  const geometry = new THREE.PlaneGeometry(CARD_W, CARD_H, 48, 32);
+  const vertexShader = document.getElementById("vert").textContent;
+  const fragmentShader = document.getElementById("frag").textContent;
+  const loader = new THREE.TextureLoader();
+
+  // Shared uniforms (same motion for every card); per-card ones added below
+  const shared = {
+    uSkew: { value: 0 },
+    uScaleX: { value: 1 },
+    uVelocity: { value: 0 },
+    uTime: { value: 0 },
+    uBend: { value: 18 },
+    uTravel: { value: new THREE.Vector2(1, 0) },
+    uRipple: { value: 4 },
+    uRgbShift: { value: 0.018 },
+    uVignette: { value: 0.25 },
+    uRadius: { value: 4 },
+    uIsoSkew: { value: 0 },
+  };
+
+  // Load each photo once; every row shares the same textures
+  const textures = PHOTOS.map((src) => {
+    const entry = { tex: null, w: 1, h: 1, waiting: [] };
+    loader.load(src, (tex) => {
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.minFilter = THREE.LinearMipmapLinearFilter;
+      tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+      Object.assign(entry, { tex, w: tex.image.width, h: tex.image.height });
+      entry.waiting.forEach((u) => apply(u, entry));
+    });
+    return entry;
+  });
+  function apply(uniforms, entry) {
+    uniforms.uTexture.value = entry.tex;
+    uniforms.uImageRes.value.set(entry.w, entry.h);
+  }
+
+  // Build the max number of rows up front; the `rows` dial just hides extras.
+  // Each row starts half-way through the photo set so rows don't repeat.
+  const MAX_ROWS = 4;
+  const rows = Array.from({ length: MAX_ROWS }, (_, r) =>
+    PHOTOS.map((_, i) => {
+      const entry = textures[(i + Math.round(r * PHOTOS.length / 2)) % PHOTOS.length];
+      const uniforms = {
+        ...shared,
+        uDir: { value: 1 },
+        uOpacity: { value: 1 },
+        uFlip: { value: 0 },
+        uTexture: { value: null },
+        uImageRes: { value: new THREE.Vector2(1, 1) },
+        uPlaneRes: { value: new THREE.Vector2(CARD_W, CARD_H) },
+      };
+      entry.tex ? apply(uniforms, entry) : entry.waiting.push(uniforms);
+      const material = new THREE.ShaderMaterial({
+        uniforms, vertexShader, fragmentShader, transparent: true,
+        side: THREE.DoubleSide, // back face shows during the click flip
+        depthTest: false, // overlap order is set explicitly with renderOrder
+      });
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.userData.lift = 0;
+      mesh.userData.extra = 0; // click bounce on top of the hover lift
+      world.add(mesh);
+      return mesh;
+    })
+  );
+
+  // ---------- flat ↔ isometric toggle ----------
+  // view.t: 0 = flat (Figma layout), 1 = isometric. GSAP tweens it; the
+  // render loop blends card positions, shear and scale from it.
+  const view = { t: 0 };
+  let isometric = false;
+  const toggle = document.getElementById("modeToggle");
+  toggle.addEventListener("click", () => {
+    isometric = !isometric;
+    toggle.textContent = isometric ? "Flat view" : "Isometric view";
+    toggle.setAttribute("aria-pressed", String(isometric));
+    gsap.to(view, {
+      t: isometric ? 1 : 0,
+      duration: reduceMotion ? 0 : P.isometric.transition,
+      ease: "power3.inOut",
+      overwrite: true,
+    });
+  });
+
+  // ---------- motion (GSAP) ----------
+  const state = { x: 0, skew: 0 };
+  let target = 0;
+  let xTo, skewTo, scrollDur, skewDur;
+  function buildTweens() {
+    // quickTo durations are fixed at creation, so rebuild when the dial changes
+    if (scrollDur === P.motion.scrollDuration && skewDur === P.motion.skewDuration) return;
+    scrollDur = P.motion.scrollDuration; skewDur = P.motion.skewDuration;
+    xTo = gsap.quickTo(state, "x", { duration: scrollDur, ease: "power3.out" });
+    skewTo = gsap.quickTo(state, "skew", { duration: skewDur, ease: "power3.out" });
+  }
+  const clamp = gsap.utils.clamp(-1, 1);
+  const scrollBy = (d) => { target += d; xTo(target); };
+
+  dial.subscribe((values) => {
+    P = values;
+    buildTweens();
+    shared.uBend.value = P.shader.bend;
+    shared.uRipple.value = P.shader.ripple;
+    shared.uRgbShift.value = P.shader.rgbShift;
+    shared.uVignette.value = P.shader.vignette;
+    shared.uRadius.value = P.layout.radius;
+    renderer.setClearColor(P.layout.background, 1);
+    document.body.style.background = P.layout.background;
+  });
+
+  // Only the canvas drives the gallery — the DialKit panel keeps its own input
+  const onCanvas = (e) => e.target === renderer.domElement;
+
+  // Mouse wheel (vertical or horizontal) → horizontal travel
+  addEventListener("wheel", (e) => {
+    if (!onCanvas(e)) return;
+    e.preventDefault();
+    const d = Math.abs(e.deltaY) > Math.abs(e.deltaX) ? e.deltaY : e.deltaX;
+    const scale = e.deltaMode === 1 ? 32 : e.deltaMode === 2 ? innerWidth : 1;
+    scrollBy(d * scale * P.motion.wheelSpeed);
+  }, { passive: false });
+
+  // Arrow keys
+  addEventListener("keydown", (e) => {
+    if (e.target.closest && e.target.closest("input, textarea, [contenteditable]")) return;
+    if (e.key === "ArrowRight") scrollBy(STEP());
+    if (e.key === "ArrowLeft") scrollBy(-STEP());
+  });
+
+  // ---------- hover: lift the card under the pointer (ease-out) ----------
+  const raycaster = new THREE.Raycaster();
+  const pointer = new THREE.Vector2();
+  let pointerIn = false, hovered = null;
+  addEventListener("pointermove", (e) => {
+    pointerIn = onCanvas(e);
+    pointer.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+  });
+  document.addEventListener("pointerleave", () => { pointerIn = false; });
+  function setHovered(mesh) {
+    if (mesh === hovered) return;
+    const dur = reduceMotion ? 0 : P.hover.duration;
+    if (hovered) gsap.to(hovered.userData, { lift: 0, duration: dur, ease: "power3.out", overwrite: true });
+    hovered = mesh;
+    document.body.classList.toggle("card-hover", !!mesh);
+    if (hovered) gsap.to(hovered.userData, { lift: P.hover.lift, duration: dur, ease: "power3.out", overwrite: true });
+  }
+  function updateHover() {
+    // Keep the jumping card hovered until it lands; otherwise it leaves the
+    // cursor mid-jump, loses its hover lift and lands at its rest position.
+    if (hovered && hovered.userData.flipping) return;
+    if (!pointerIn) return setHovered(null);
+    raycaster.setFromCamera(pointer, camera);
+    const hits = raycaster.intersectObjects(world.children.filter((m) => m.visible), false);
+    // Topmost card = highest renderOrder
+    hits.sort((a, b) => b.object.renderOrder - a.object.renderOrder);
+    setHovered(hits.length ? hits[0].object : null);
+  }
+
+  // Click the hovered card: 180° flip while lifting to 1.5× the hover lift,
+  // then settle back at the hover position.
+  addEventListener("click", (e) => {
+    if (!onCanvas(e) || !hovered) return;
+    const m = hovered, d = m.userData;
+    if (d.flipping) return;
+    d.flipping = true;
+    const dur = reduceMotion ? 0 : P.hover.flipDuration;
+    const flip = m.material.uniforms.uFlip;
+    // Horizontal coin flip: one full turn around the vertical axis per click.
+    // It stays flipped (no return trip); the next click turns it again.
+    gsap.timeline({ onComplete: () => { d.flipping = false; flip.value = 0; } })
+      .fromTo(flip, { value: 0 }, {
+        // "left" = the original direction; "right" spins the other way
+        value: THREE.MathUtils.degToRad(P.hover.flipAngle) * (P.hover.flipDirection === "right" ? -1 : 1),
+        duration: dur,
+        ease: P.hover.flipEase,
+      }, 0)
+      // Jump: shoots up and slows at the peak, then falls back with gravity
+      .to(d, { extra: P.hover.jumpHeight, duration: dur / 2, ease: "power2.out" }, 0)
+      .to(d, { extra: 0, duration: dur / 2, ease: "power2.in" }, dur / 2);
+  });
+
+  // ---------- render loop on GSAP's ticker ----------
+  let prevX = 0;
+  gsap.ticker.add((time, deltaMs) => {
+    const dt = Math.max(deltaMs, 1) / 1000;
+    const velocity = (state.x - prevX) / dt; // px per second
+    prevX = state.x;
+
+    const { maxSkew, shrink, velForMax } = P.motion;
+    // Normalised, smoothed speed (-1..1) — kept independent of maxSkew so
+    // the shader effects still work when the skew dial is at 0.
+    skewTo(reduceMotion ? 0 : clamp(velocity / velForMax));
+    const amt = state.skew;
+
+    // Isometric blend: 0 = flat row, 1 = Figma isometric staircase
+    const t = view.t, iso = P.isometric;
+    const lerp = (a, b) => a + (b - a) * t;
+
+    // The scroll skew is a flat-row effect (horizontal travel). On the staircase
+    // it would fight the 24° resting shear (cards straighten up moving up-right
+    // and over-shear moving down-left), so it fades out with t; there the drag
+    // bend along the travel axis carries the motion instead.
+    shared.uSkew.value = THREE.MathUtils.degToRad(amt * maxSkew) * (1 - t);
+    shared.uIsoSkew.value = THREE.MathUtils.degToRad(iso.cardSkew) * t;
+
+    // Forward axis on screen: flat row → (1, 0); staircase → (stepX, stepY)
+    shared.uTravel.value
+      .set(lerp(1, iso.stepX / STEP()), lerp(0, iso.stepY / STEP()))
+      .normalize();
+    shared.uScaleX.value = lerp(1, iso.cardScaleX) * (1 - shrink * Math.abs(amt));
+    shared.uVelocity.value = amt;
+    shared.uTime.value = time;
+
+    const step = STEP(), loop = LOOP();
+    const halfW = innerWidth / 2;
+    const { rows: rowCount, rowGap, stagger, alternate } = P.layout;
+
+    world.scale.setScalar(lerp(1, iso.scale));
+    const blockH = rowCount * CARD_H + (rowCount - 1) * rowGap;  // whole stack, centred
+
+    for (let r = 0; r < MAX_ROWS; r++) {
+      const visible = r < rowCount;
+      const dir = alternate && r % 2 === 1 ? -1 : 1;
+      const flatY = blockH / 2 - CARD_H / 2 - r * (CARD_H + rowGap); // y is up in three.js
+      const isoRowY = -r * (CARD_H + rowGap);   // iso: row 1 centred, extra rows below
+      const offset = r * stagger * step;
+      // Iso mode shows one staircase like the Figma frame; extra rows fade out
+      const opacity = r === 0 || iso.extraRows ? 1 : 1 - t;
+
+      for (let i = 0; i < rows[r].length; i++) {
+        const mesh = rows[r][i];
+        mesh.visible = visible && opacity > 0.001;
+        if (!mesh.visible) continue;
+        const u = mesh.material.uniforms;
+        u.uDir.value = dir;
+        u.uOpacity.value = opacity;
+
+        // Centred world x. The constant keeps the Figma alignment (first card's
+        // left edge at -24px) in flat mode; wrapping around 0 keeps the loop
+        // seam off-screen in both views.
+        const x = i * step - dir * state.x - offset + (START_X + CARD_W / 2 - halfW);
+        const wx = gsap.utils.wrap(-loop / 2, loop / 2, x);
+
+        // Same scroll coordinate, laid on the staircase: k cards from centre,
+        // each one stepX right and stepY up. Scrolling forward moves k down,
+        // carrying cards from top-right to bottom-left.
+        const k = wx / step;
+        const isoX = k * iso.stepX + iso.offsetX;
+        const isoY = k * iso.stepY + iso.offsetY + isoRowY;
+        mesh.position.set(lerp(wx, isoX), lerp(flatY, isoY) + mesh.userData.lift + mesh.userData.extra, 0);
+
+        // Overlap order: by default each lower-left card sits on top of the one
+        // above-right of it.
+        mesh.renderOrder = -r * 10000 - wx;
+      }
+    }
+    world.updateMatrixWorld();
+    updateHover();
+    renderer.render(scene, camera);
+  });
+</script>
+</body>
+</html>
